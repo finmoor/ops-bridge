@@ -22,12 +22,11 @@ COPY agent.py config.py ./
 COPY core/ core/
 COPY services/ services/
 
-# result 出站队列账本默认落挂载卷（compose 均挂 /data），容器重建/镜像升级不丢未确认回执;
-# 部署可用环境变量 OUTBOX_PATH 覆盖
+# result 出站队列账本不在这里写死：config.py 默认放到被管根目录（PROJECTS_ROOT，默认 /data，挂载卷内）下的
+# .service-agent/outbox.json，自定义 MANAGED_PROJECTS_ROOT 时跟着走；部署可用环境变量 OUTBOX_PATH 覆盖
 ARG AGENT_VERSION=dev
 ENV AGENT_VERSION=${AGENT_VERSION}
 LABEL org.opencontainers.image.version=${AGENT_VERSION}
-ENV OUTBOX_PATH=/data/.service-agent/outbox.json
 
 EXPOSE 18081
 

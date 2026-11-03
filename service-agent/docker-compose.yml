@@ -9,7 +9,8 @@ services:
       - .env
     environment:
       WS_URL: ${WS_URL:?WS_URL is required}
-      AGENT_ID: ${AGENT_ID:-}
+      # 交付中枢「服务器」页上这台服务器的编码（系统生成，新建服务器后弹出的 AGENT_ID），不能留空
+      AGENT_ID: ${AGENT_ID:?AGENT_ID is required (the server code shown on the hub Servers page)}
       AGENT_KEY: ${AGENT_KEY:?AGENT_KEY is required}
       RECONNECT_DELAY: ${RECONNECT_DELAY:-5}
       HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-30}
@@ -17,16 +18,18 @@ services:
       HEALTH_PORT: ${HEALTH_PORT:-18081}
       APP_HOST: ${APP_HOST:-host.docker.internal}
       AGENT_LOCAL_SECRET: ${AGENT_LOCAL_SECRET:-}
-      # result 出站队列账本:落在挂载卷内,容器重建/镜像升级不丢未确认回执
-      OUTBOX_PATH: ${OUTBOX_PATH:-/data/.service-agent/outbox.json}
+      # 被管根目录按同一路径挂进容器（见 volumes），出站队列账本、升级状态默认放在它下面的 .service-agent/
+      PROJECTS_ROOT: ${MANAGED_PROJECTS_ROOT:-/data}
     ports:
       # 本机业务服务（admin / worker）经 host.docker.internal 访问本机 agent 的 /queryPlugin、/pluginSyncChanged、
       # /verifyOpsCode、/envConfig、/instanceSnapshot。发布到宿主（内网可接受）；这些端点自身靠 AGENT_LOCAL_SECRET
       # （请求头 X-Agent-Secret）收敛，未配置时一律回 403；不绑 127.0.0.1（会打断 host-gateway 路径）。
-      - "18081:18081"
+      # 宿主端口跟 HEALTH_PORT 走：改了 HEALTH_PORT，应用的 sync-plugins.config.json 里 adminUrl 的端口也要改成同一个
+      - "${HEALTH_PORT:-18081}:${HEALTH_PORT:-18081}"
     volumes:
       - ${HOST_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
-      - ${MANAGED_PROJECTS_ROOT:-/data}:/data
+      # 容器内外同一路径：中枢下发的目录是宿主机路径，业务 compose 的相对挂载（如 ./logs）也按宿主机路径解析
+      - ${MANAGED_PROJECTS_ROOT:-/data}:${MANAGED_PROJECTS_ROOT:-/data}
     extra_hosts:
       # drain/健康检查经此连宿主机端口映射；agent 跟被管容器各在独立 bridge 网络命名空间，127.0.0.1 互不可达
       - "host.docker.internal:host-gateway"

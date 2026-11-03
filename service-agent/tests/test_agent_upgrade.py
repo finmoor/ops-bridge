@@ -809,3 +809,14 @@ def test_cleanup_retries_when_docker_unavailable(monkeypatch):
     monkeypatch.setattr(u, 'docker', Mock(side_effect=RuntimeError('daemon unavailable')))
     u.cleanup_executor()
     assert u._cleaned_request is None
+
+
+@pytest.mark.parametrize('root, expected', [
+    ('/opt/apps', '/opt/apps/.service-agent/upgrades'),
+    ('', '/data/.service-agent/upgrades'),
+])
+def test_state_root_defaults_under_projects_root(monkeypatch, root, expected):
+    """自定义被管根目录后 /data 不再是挂载卷：状态目录跟着 PROJECTS_ROOT 走，否则能力探测找不到可写挂载。"""
+    monkeypatch.delenv('AGENT_UPGRADE_DIR', raising=False)
+    monkeypatch.setenv('PROJECTS_ROOT', root)
+    assert u.state_root().parent.as_posix() == expected

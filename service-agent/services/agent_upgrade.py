@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import posixpath
 import re
 import subprocess
 import threading
@@ -14,6 +15,7 @@ import uuid
 import yaml
 
 from core.capabilities import CAPABILITIES
+from services.compose import replace_service_image
 
 PROTOCOL = 1
 TERMINAL = {'success', 'rolled_back', 'failed'}
@@ -70,8 +72,11 @@ def atomic_text(path, text):
 
 
 def state_root():
-    identity = hashlib.sha256(os.getenv('AGENT_ID', '').encode()).hexdigest()[:16]
-    return Path(os.getenv('AGENT_UPGRADE_DIR', '/data/.service-agent/upgrades')) / identity
+    identity = hashlib.sha256(os.getenv('AGENT_ID', '').strip().encode()).hexdigest()[:16]
+    # 默认放在被管根目录（PROJECTS_ROOT，与宿主机同路径挂载）下；不 import config，执行器容器里没有 WS_URL 等
+    projects_root = (os.getenv('PROJECTS_ROOT') or '').strip() or '/data'
+    default = posixpath.join(projects_root, '.service-agent', 'upgrades')
+    return Path(os.getenv('AGENT_UPGRADE_DIR') or default) / identity
 
 
 def read_json(path):
@@ -474,55 +479,15 @@ def compose(manifest, *args):
                   *files, *args, timeout=180)
 
 
-SERVICE_KEY = re.compile(r'(["\']?)([^"\':#\s][^"\':#]*)\1\s*:\s*(#.*)?')
-
-
 def replace_image_text(text, service, image):
-    """只替换 services.<service>.image 这一行，保留其余内容、注释和引号。
+    """只替换 services.<service>.image 这一行（与应用更新共用 compose.replace_service_image）。
 
-    整份 YAML 重新序列化会丢注释，并按 YAML 1.1 改写未加引号的值（如端口 22:22、on/off）。
-    仅支持块样式 Compose；定位不到时抛错，由能力探测提前拒绝自升级。
+    定位不到时抛错，由能力探测提前拒绝自升级。
     """
-    lines = text.splitlines(keepends=True)
-    in_services = False
-    service_indent = None
-    child_indent = None
-    in_service = False
-    for index, line in enumerate(lines):
-        body = line.rstrip('\r\n')
-        stripped = body.strip()
-        if not stripped or stripped.startswith('#'):
-            continue
-        indent = len(body) - len(body.lstrip(' '))
-        if indent == 0:
-            in_services = re.fullmatch(r'services\s*:\s*(#.*)?', stripped) is not None
-            service_indent = None
-            in_service = False
-            continue
-        if not in_services:
-            continue
-        if service_indent is None or indent <= service_indent:
-            match = SERVICE_KEY.fullmatch(stripped)
-            if not match:
-                continue
-            service_indent = indent
-            in_service = match.group(2).strip() == service
-            child_indent = None
-            continue
-        if not in_service:
-            continue
-        if child_indent is None:
-            child_indent = indent
-        if indent == child_indent and re.match(r'image\s*:', stripped):
-            comment = re.search(r'\s+#.*$', re.sub(r'"[^"]*"|\'[^\']*\'', lambda m: '_' * len(m.group(0)), body))
-            tail = body[comment.start():] if comment else ''
-            lines[index] = ' ' * indent + 'image: ' + json.dumps(image) + tail + line[len(body):]
-            result = ''.join(lines)
-            document = yaml.safe_load(result) or {}
-            if ((document.get('services') or {}).get(service) or {}).get('image') == image:
-                return result
-            break
-    raise ValueError('无法在 Compose 文件中定位 Agent 的 image 行，请改为块样式配置后再升级')
+    try:
+        return replace_service_image(text, service, image)
+    except ValueError:
+        raise ValueError('无法在 Compose 文件中定位 Agent 的 image 行，请改为块样式配置后再升级') from None
 
 
 def write_image(manifest, image):

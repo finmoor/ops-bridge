@@ -89,6 +89,75 @@ def test_update_image_in_compose_returns_empty_when_no_match(tmp_path: Path) -> 
     assert yaml.safe_load(compose_file.read_text(encoding="utf-8")) == original
 
 
+BUSINESS_COMPOSE = """# 部署说明：端口别改
+services:
+  api:
+    image: repo/app:1.0  # 发版时由中枢改
+    ports:
+      - 22:22
+    environment:
+      FLAG: on
+      UMASK: 0022
+  worker:
+    image: 'repo/app:1.0'
+    command: ["node", "worker.js"]
+  db:
+    image: mysql:8
+"""
+
+
+def test_update_image_in_compose_only_touches_matching_image_lines(tmp_path: Path) -> None:
+    """整份重新序列化会丢注释，并按 YAML 1.1 把 22:22、on、0022 改写成别的值，带着改过的端口重建业务容器。"""
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(BUSINESS_COMPOSE, encoding="utf-8")
+
+    updated = compose.update_image_in_compose(str(compose_file), "repo/app:2.0")
+
+    after = compose_file.read_text(encoding="utf-8")
+    changed = [(a, b) for a, b in zip(BUSINESS_COMPOSE.splitlines(), after.splitlines()) if a != b]
+    assert updated == ["api", "worker"]
+    assert changed == [
+        ("    image: repo/app:1.0  # 发版时由中枢改", '    image: "repo/app:2.0"  # 发版时由中枢改'),
+        ("    image: 'repo/app:1.0'", '    image: "repo/app:2.0"'),
+    ]
+    assert len(after.splitlines()) == len(BUSINESS_COMPOSE.splitlines())
+
+
+def test_update_image_in_compose_keeps_crlf(tmp_path: Path) -> None:
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_bytes(b"services:\r\n  api:\r\n    image: repo/app:1.0\r\n    restart: always\r\n")
+
+    assert compose.update_image_in_compose(str(compose_file), "repo/app:2.0") == ["api"]
+    assert compose_file.read_bytes() == b'services:\r\n  api:\r\n    image: "repo/app:2.0"\r\n    restart: always\r\n'
+
+
+@pytest.mark.parametrize("text", [
+    "services: {api: {image: repo/app:1.0}}\n",  # 流样式没法逐行定位
+    "x-base: &base\n  image: repo/app:1.0\nservices:\n  api:\n    <<: *base\n",  # 合并键继承来的 image
+])
+def test_update_image_in_compose_refuses_when_image_line_cannot_be_located(tmp_path: Path, text: str) -> None:
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="api"):
+        compose.update_image_in_compose(str(compose_file), "repo/app:2.0")
+    assert compose_file.read_text(encoding="utf-8") == text
+
+
+def test_update_image_in_compose_refuses_when_other_config_would_change(tmp_path: Path, monkeypatch) -> None:
+    """逐行替换后整份再比一遍：除了 image 还有别的值变了就不写。"""
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(BUSINESS_COMPOSE, encoding="utf-8")
+    real = compose.replace_service_image
+    monkeypatch.setattr(
+        compose, "replace_service_image", lambda text, svc, image: real(text, svc, image).replace("22:22", "2222")
+    )
+
+    with pytest.raises(ValueError, match="其他配置"):
+        compose.update_image_in_compose(str(compose_file), "repo/app:2.0")
+    assert compose_file.read_text(encoding="utf-8") == BUSINESS_COMPOSE
+
+
 def test_run_compose_uses_cached_command(monkeypatch: pytest.MonkeyPatch) -> None:
     compose._compose_cmd = ["docker", "compose"]
     calls: list[tuple[list[str], str]] = []

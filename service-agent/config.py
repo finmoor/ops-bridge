@@ -1,5 +1,5 @@
 import os
-import socket
+import posixpath
 import sys
 import logging
 from datetime import datetime, timedelta, timezone
@@ -19,7 +19,8 @@ class ChinaTimeFormatter(logging.Formatter):
         return dt.isoformat(timespec='seconds')
 
 WS_URL             = os.getenv('WS_URL', '')
-AGENT_ID           = os.getenv('AGENT_ID', socket.gethostname())
+# 必须等于中枢「服务器」页的服务器编码；不退回主机名（容器主机名是随机串，中枢不认识，只会一直鉴权失败）
+AGENT_ID           = (os.getenv('AGENT_ID') or '').strip()
 AGENT_KEY          = os.getenv('AGENT_KEY', '')
 # 连接鉴权 key 的传递方式：auto（默认）先走 X-Agent-Key 请求头，被只认 URL 参数的旧中枢拒绝后自动改用 ?key=；
 # header / query 固定其一。请求头方式下 key 不出现在 URL 里，不会被网关/nginx 的访问日志记下来。
@@ -32,7 +33,6 @@ STATUS_REPORT_INTERVAL = int(os.getenv('STATUS_REPORT_INTERVAL', '120'))
 # restart/update 结束后短期跟踪采集：worker 未通知 Agent（直连拉清单、旧镜像）时也能及时上报插件同步结果
 PLUGIN_FOLLOW_UP_INTERVAL = int(os.getenv('PLUGIN_FOLLOW_UP_INTERVAL', '10'))
 PLUGIN_FOLLOW_UP_TIMEOUT = int(os.getenv('PLUGIN_FOLLOW_UP_TIMEOUT', '300'))
-OUTBOX_PATH        = os.getenv('OUTBOX_PATH', 'outbox.json')
 HEALTH_HOST        = os.getenv('HEALTH_HOST', '0.0.0.0')
 HEALTH_PORT        = int(os.getenv('HEALTH_PORT', '18081'))
 # agent 自己也是容器，跟被管的业务容器各在独立的 bridge 网络命名空间，127.0.0.1 谁也连不到谁；
@@ -44,8 +44,11 @@ APP_HOST           = os.getenv('APP_HOST', 'host.docker.internal')
 AGENT_LOCAL_SECRET = os.getenv('AGENT_LOCAL_SECRET', '')
 # hub 的 HTTP 基址（日志归档上传用）。留空则由 WS_URL 推导：ws→http、wss→https、去掉 /ws/agent 及其后内容。
 HUB_HTTP_URL       = os.getenv('HUB_HTTP_URL', '').strip().rstrip('/')
-# compose 项目发现的扫描根（容器内路径；docker-compose.yml 把宿主机 MANAGED_PROJECTS_ROOT 挂到 /data）
-PROJECTS_ROOT      = os.getenv('PROJECTS_ROOT', '/data')
+# 被管项目根目录，也是 compose 项目发现的扫描根。docker-compose.yml 把宿主机 MANAGED_PROJECTS_ROOT 按同一路径挂进容器，
+# 并把它传成 PROJECTS_ROOT：中枢下发的目录是宿主机路径，业务 compose 的相对挂载也按宿主机路径解析，容器内外必须一致
+PROJECTS_ROOT      = (os.getenv('PROJECTS_ROOT') or '').strip() or '/data'
+# result 出站队列账本：默认放在被管根目录下（挂载卷内），容器重建、镜像升级不丢未确认回执
+OUTBOX_PATH        = os.getenv('OUTBOX_PATH') or posixpath.join(PROJECTS_ROOT, '.service-agent', 'outbox.json')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,5 +59,7 @@ for handler in logging.getLogger().handlers:
 
 if not WS_URL:
     sys.exit("ERROR: WS_URL is not set. Example: ws://192.168.1.100:8080/ws/agent")
+if not AGENT_ID:
+    sys.exit("ERROR: AGENT_ID is not set. 填交付中枢「服务器」页上这台服务器的服务器编码（新建服务器后弹出的 AGENT_ID）。")
 if not AGENT_KEY:
     sys.exit("ERROR: AGENT_KEY is not set.")

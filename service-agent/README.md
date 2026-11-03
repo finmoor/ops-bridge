@@ -8,7 +8,7 @@
 1. 内网服务器已通过 docker compose 部署好业务容器（compose 文件已在服务器上）
 2. 在该服务器上运行 service-agent
 3. 远程平台下发指令：
-  - update  →  修改 compose 中匹配服务的 image，然后执行 pull + down + up -d
+  - update  →  修改 compose 中匹配服务的 image，然后执行 pull + down + up -d（只改匹配服务的 `image:` 这一行，其余内容一个字节不动；定位不到 image 行时整条命令失败、不改文件，限制同下文「Agent 自升级」）
   - restart →  docker compose restart（重启容器，不重建）
   - logs    →  docker compose logs -f --tail N（持续查看服务日志）
 ```
@@ -55,7 +55,7 @@ service-agent（容器）
 | 变量                  | 说明                          | 示例                                                 |
 | --------------------- | ----------------------------- | ---------------------------------------------------- |
 | `WS_URL`              | 控制台 WebSocket 地址         | `ws://192.168.1.10:13000/ws/agent`                   |
-| `AGENT_ID`            | Agent 唯一标识                | `prod-server-01`                                     |
+| `AGENT_ID`            | 必填。交付中枢「服务器」页上这台服务器的编码（系统生成，新建服务器后和 `AGENT_KEY` 一起弹出），照抄；留空时 agent 启动即退出，不再退回主机名 | 中枢服务器页复制的编码 |
 | `AGENT_KEY`           | Hub 为该 agent 签发的独立 key | `hub-issued-agent-key`                               |
 | `AGENT_AUTH_MODE`     | key 的传递方式：`auto`（默认，先用 `X-Agent-Key` 请求头，只认 URL 参数的旧版 Hub 拒绝时改用 URL 参数，Hub 升级后自动切回请求头；key 本身被拒时不回退）、`header`、`query` | `auto` |
 | `RECONNECT_DELAY`     | 断线重连间隔（秒），默认 `5`  | `5`                                                  |
@@ -63,10 +63,12 @@ service-agent（容器）
 | `STATUS_REPORT_INTERVAL` | 定时巡检上报间隔（秒），默认 `120` | `120`                                          |
 | `PLUGIN_FOLLOW_UP_INTERVAL` | restart/update 后跟踪插件同步的采集间隔（秒），默认 `10` | `10`                     |
 | `PLUGIN_FOLLOW_UP_TIMEOUT` | 跟踪插件同步的最长时长（秒），默认 `300`；同步结束，或容器启动 90 秒仍无本次同步回执即提前停止 | `300` |
-| `HEALTH_PORT`         | 容器内健康检查端口            | `18081`                                              |
+| `HEALTH_PORT`         | agent 本机 HTTP 端口（健康检查和下文「本机 HTTP 端点」），默认 `18081`；`docker-compose.yml` 在宿主机发布同一个端口。改了它，应用 `sync-plugins.config.json` 里 `adminUrl` 的端口要改成同一个 | `18081` |
 | `SERVICE_AGENT_IMAGE` | 运行时拉取的镜像地址          | `registry.example.com/orchidea/service-agent:latest` |
 | `HUB_HTTP_URL`        | 中枢 HTTP 基址（日志归档上传用），留空按 `WS_URL` 推导 | `https://hub.example.com`                            |
-| `PROJECTS_ROOT`       | compose 项目发现的扫描根（容器内路径），默认 `/data`   | `/data`                                              |
+| `MANAGED_PROJECTS_ROOT` | 宿主机上的被管根目录，默认 `/data`。`docker-compose.yml` 把它按同一路径挂进容器并传成 `PROJECTS_ROOT`：中枢下发的目录是宿主机路径，业务 compose 的相对挂载（如 `./logs`）也按宿主机路径解析，容器内外必须一致 | `/opt/apps` |
+| `PROJECTS_ROOT`       | 容器内的被管根目录，也是 compose 项目发现的扫描根，默认 `/data`；用本仓 compose 时不要单独设，跟着 `MANAGED_PROJECTS_ROOT` 走。启动时会检查它在容器内外是不是同一路径，不是就在日志里报错 | `/data` |
+| `OUTBOX_PATH`         | 出站队列账本，默认 `<PROJECTS_ROOT>/.service-agent/outbox.json`（挂载卷内，容器重建不丢未确认的回执） | 留空 |
 | `APP_HOST`            | 回到宿主机的地址，默认 `host.docker.internal`；`drain` 与健康检查经它 + compose 解析出的映射端口访问被管应用 | `host.docker.internal` |
 | `AGENT_LOCAL_SECRET`  | 本机业务服务调用 Agent 本机端点（见下文「本机 HTTP 端点」）的共享密钥，请求头 `X-Agent-Secret` 带上；`odk init` 每机随机生成并渲染进 `.env`。未配置时这些端点一律回 403 | 随机字符串 |
 
@@ -169,8 +171,10 @@ service-agent/
 pip install -r requirements-dev.txt
 
 $env:WS_URL="ws://YOUR_HUB_HOST:PORT/ws/agent"
-$env:AGENT_ID="local-dev"
+$env:AGENT_ID="<中枢生成的服务器编码>"
 $env:AGENT_KEY="hub-issued-agent-key"
+# 出站队列账本默认在 <PROJECTS_ROOT>/.service-agent/ 下，本地运行时指到一个可写目录
+$env:PROJECTS_ROOT="D:/agent-dev"
 
 python agent.py
 ```
@@ -187,7 +191,8 @@ pytest --cov=agent --cov=config --cov=core --cov=services --cov-report=term-miss
 ## 容器部署说明
 
 - `docker-compose.yml` 已改为只拉取镜像，不再本地 `build`
-- 启动前需要先把 `.env.example` 复制为 `.env`，并填好 `SERVICE_AGENT_IMAGE`、`WS_URL`、`AGENT_KEY`
+- 启动前需要先把 `.env.example` 复制为 `.env`，并填好 `SERVICE_AGENT_IMAGE`、`WS_URL`、`AGENT_ID`、`AGENT_KEY`（后三项照抄中枢新建服务器时弹出的配置）
+- 被管根目录不是 `/data` 时设 `MANAGED_PROJECTS_ROOT`，不要只改挂载的一边；这份 compose 要配本版及以后的镜像（旧镜像的出站队列账本和升级状态写死在 `/data` 下）
 - 健康检查会访问容器内的 `http://127.0.0.1:${HEALTH_PORT}/health`
 - agent 镜像内已内置 `docker compose` v2 CLI；如果宿主环境或派生镜像替换了该 CLI，需保证 `docker compose version` 可用
 - 宿主机需要正确挂载 Docker Socket 和业务 compose 根目录，否则 Agent 虽然能启动，但无法执行 compose 指令
@@ -205,7 +210,7 @@ pytest --cov=agent --cov=config --cov=core --cov=services --cov-report=term-miss
 
 Agent 等待当前服务操作完成后，用当前已安装镜像启动独立的临时执行器。执行器先拉取并固定目标 digest，再仅重建 Agent 服务；新版实际镜像与 Hub 确认、健康检查都通过才算成功。失败自动恢复旧镜像，执行器中断时根据持久化账本补偿，业务容器不重启。
 
-部署需要挂载 Docker socket、Compose 项目文件和持久化状态目录。支持多个 Compose 文件，修改最后一个定义本服务 image 的文件。`AGENT_ID` 须显式配置；自定义 hostname 时可通过 `AGENT_CONTAINER_NAME` 指定自身容器。状态目录默认 `/data/.service-agent/upgrades/`（`AGENT_UPGRADE_DIR` 可覆盖）。私有仓库凭据目录通过 bind mount 与 `DOCKER_CONFIG` 配置，辅助执行器只读使用，不上传凭据。
+部署需要挂载 Docker socket、Compose 项目文件和持久化状态目录。支持多个 Compose 文件，修改最后一个定义本服务 image 的文件。`AGENT_ID` 须显式配置；自定义 hostname 时可通过 `AGENT_CONTAINER_NAME` 指定自身容器。状态目录默认 `<PROJECTS_ROOT>/.service-agent/upgrades/`（默认即 `/data/.service-agent/upgrades/`，`AGENT_UPGRADE_DIR` 可覆盖）。私有仓库凭据目录通过 bind mount 与 `DOCKER_CONFIG` 配置，辅助执行器只读使用，不上传凭据。
 
 修改 Compose 时只替换本服务的 `image:` 这一行（保留该行的行尾注释），其余内容、注释和引号保持原样（整份重新序列化会丢注释，并按 YAML 1.1 改写 `22:22`、`on` 这类未加引号的值）。`image:` 必须以单行键值直接写在该服务自己的映射里，不支持流样式、合并键或锚点继承；无法定位时能力探测直接给出原因，不允许远程升级，但照常上报当前镜像。能力探测失败后每 60 秒重试。
 

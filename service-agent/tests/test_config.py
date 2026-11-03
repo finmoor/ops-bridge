@@ -48,6 +48,30 @@ def test_config_requires_agent_key(monkeypatch: pytest.MonkeyPatch) -> None:
         _import_config(monkeypatch, AGENT_KEY="")
 
 
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_config_requires_agent_id(monkeypatch: pytest.MonkeyPatch, value) -> None:
+    """不能退回主机名：容器主机名是随机串，中枢不认识，只会一直鉴权失败。"""
+    with pytest.raises(SystemExit, match="AGENT_ID is not set.*服务器编码"):
+        _import_config(monkeypatch, AGENT_ID=value)
+
+
+def test_config_strips_agent_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _import_config(monkeypatch, AGENT_ID="  srv-01 \n").AGENT_ID == "srv-01"
+
+
+@pytest.mark.parametrize("outbox", [None, ""])
+def test_outbox_path_defaults_under_projects_root(monkeypatch: pytest.MonkeyPatch, outbox) -> None:
+    """账本跟着被管根目录走：自定义 MANAGED_PROJECTS_ROOT 后 /data 不再是挂载卷，写在那里容器重建就丢。"""
+    config = _import_config(monkeypatch, PROJECTS_ROOT="/opt/apps", OUTBOX_PATH=outbox)
+    assert config.OUTBOX_PATH == "/opt/apps/.service-agent/outbox.json"
+
+
+def test_outbox_path_and_projects_root_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _import_config(monkeypatch, PROJECTS_ROOT=" ", OUTBOX_PATH="/state/outbox.json")
+    assert config.PROJECTS_ROOT == "/data"
+    assert config.OUTBOX_PATH == "/state/outbox.json"
+
+
 def test_china_time_formatter_respects_datefmt(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _import_config(monkeypatch)
     formatter = config.ChinaTimeFormatter("%(asctime)s", "%Y-%m-%d %H:%M:%S")

@@ -1,6 +1,8 @@
+import copy
 import json
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -44,35 +46,97 @@ def find_compose_file(project_dir):
 
 
 def read_compose_file(compose_file):
-    return Path(compose_file).read_text(encoding='utf-8')
+    """按原样读取（不转换换行符），改写和回滚都能保持文件原来的 CRLF / LF。"""
+    with open(compose_file, encoding='utf-8', newline='') as f:
+        return f.read()
 
 
 def restore_compose_file(compose_file, original_content):
-    Path(compose_file).write_text(original_content, encoding='utf-8')
+    with open(compose_file, 'w', encoding='utf-8', newline='') as f:
+        f.write(original_content)
+
+
+SERVICE_KEY = re.compile(r'(["\']?)([^"\':#\s][^"\':#]*)\1\s*:\s*(#.*)?')
+
+
+def replace_service_image(text, service, image):
+    """只替换 services.<service>.image 这一行，保留其余内容、注释、引号和换行符。
+
+    整份 YAML 重新序列化会丢注释，并按 YAML 1.1 改写未加引号的值（如端口 22:22、on/off、0022）。
+    仅支持块样式 Compose，image 须以单行键值直接写在该服务自己的映射里；定位不到时抛 ValueError。
+    """
+    lines = text.splitlines(keepends=True)
+    in_services = False
+    service_indent = None
+    child_indent = None
+    in_service = False
+    for index, line in enumerate(lines):
+        body = line.rstrip('\r\n')
+        stripped = body.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        indent = len(body) - len(body.lstrip(' '))
+        if indent == 0:
+            in_services = re.fullmatch(r'services\s*:\s*(#.*)?', stripped) is not None
+            service_indent = None
+            in_service = False
+            continue
+        if not in_services:
+            continue
+        if service_indent is None or indent <= service_indent:
+            match = SERVICE_KEY.fullmatch(stripped)
+            if not match:
+                continue
+            service_indent = indent
+            in_service = match.group(2).strip() == service
+            child_indent = None
+            continue
+        if not in_service:
+            continue
+        if child_indent is None:
+            child_indent = indent
+        if indent == child_indent and re.match(r'image\s*:', stripped):
+            comment = re.search(r'\s+#.*$', re.sub(r'"[^"]*"|\'[^\']*\'', lambda m: '_' * len(m.group(0)), body))
+            tail = body[comment.start():] if comment else ''
+            lines[index] = ' ' * indent + 'image: ' + json.dumps(image) + tail + line[len(body):]
+            result = ''.join(lines)
+            document = yaml.safe_load(result) or {}
+            if ((document.get('services') or {}).get(service) or {}).get('image') == image:
+                return result
+            break
+    raise ValueError(f"无法在 Compose 文件中定位服务 {service} 的 image 行，请改为块样式配置")
 
 
 def update_image_in_compose(compose_file, new_image):
     """
     将 compose 文件中与 new_image 同仓库（忽略 tag）的服务镜像更新为 new_image。
     返回被更新的服务名列表。
+
+    只改匹配服务的 image 这一行，其余内容一个字节不动；有一个匹配服务定位不到 image 行
+    （流样式、合并键继承等）就整体拒绝、不写文件，不退回整份重新序列化。
     """
-    content = yaml.safe_load(read_compose_file(compose_file)) or {}
+    text = read_compose_file(compose_file)
+    content = yaml.safe_load(text) or {}
 
     new_repo = new_image.rsplit(':', 1)[0]
     updated = []
+    expected = copy.deepcopy(content)
 
     for svc_name, svc_cfg in (content.get('services') or {}).items():
         if not isinstance(svc_cfg, dict):
             continue
         current_image = svc_cfg.get('image', '')
-        if current_image.rsplit(':', 1)[0] == new_repo:
-            svc_cfg['image'] = new_image
+        if isinstance(current_image, str) and current_image.rsplit(':', 1)[0] == new_repo:
+            text = replace_service_image(text, svc_name, new_image)
+            expected['services'][svc_name]['image'] = new_image
             updated.append(svc_name)
             logger.info(f"Updated service '{svc_name}': {current_image} -> {new_image}")
 
     if updated:
-        with open(compose_file, 'w', encoding='utf-8', newline='\n') as f:
-            yaml.safe_dump(content, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        # 逐行替换后整份再解析一遍：除了这几个 image，解析结果必须和原文件一致
+        if (yaml.safe_load(text) or {}) != expected:
+            raise ValueError('改写 Compose 镜像后其他配置发生了变化，已拒绝写入')
+        restore_compose_file(compose_file, text)
 
     return updated
 

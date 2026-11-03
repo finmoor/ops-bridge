@@ -142,7 +142,7 @@ Agent 连上后立即上报，并随每次心跳重复上报 `agent_report`：
 | --- | --- | --- |
 | `requestId` | ✅ | 请求唯一 ID，ack / result 原样返回 |
 | `action` | ✅ | 见下表 |
-| `dir` | ✅ | compose 文件所在目录的宿主机绝对路径 |
+| `dir` | ✅ | compose 文件所在目录的宿主机绝对路径。Agent 把被管根目录按同一路径挂进容器，直接以它为工作目录执行 compose；容器内外路径不一致时启动日志会报错 |
 | `image` | update 必填 | 新镜像全名含 tag；Agent 在 compose 里找同仓库的服务替换 `image` |
 | `graceful` | 否 | 命令成功后再等待应用自报健康，确认后才回 success |
 | `drain` | 否 | restart/update 前先在同一条命令里下线排空，需要 `drain_restart` 能力 |
@@ -151,7 +151,7 @@ Agent 连上后立即上报，并随每次心跳重复上报 `agent_report`：
 
 | action | 执行流程 |
 | --- | --- |
-| `update` | 改 compose 中同仓库服务的 `image` → `pull` 成功后才切换 →（`drain: true` 时此处下线排空，失败则恢复 compose 并结束，实例保持原状）→ `down` → `up -d`；拉取或启动失败会恢复原 compose 并尝试拉起旧版本 |
+| `update` | 改 compose 中同仓库服务的 `image`（只替换这几行，其余内容、注释、引号原样保留；块样式以外的写法定位不到 image 行时直接失败、不改文件）→ `pull` 成功后才切换 →（`drain: true` 时此处下线排空，失败则恢复 compose 并结束，实例保持原状）→ `down` → `up -d`；拉取或启动失败会恢复原 compose 并尝试拉起旧版本 |
 | `restart` | （`drain: true` 时先下线排空，失败则不重启）→ `docker compose restart` |
 | `drain` | 只调用应用下线接口；两步模式（旧 Agent）的第一步 |
 | `plugin_scan` / `plugin_remove` / `plugin_restore` | 业务容器插件目录盘点与文件操作，需要 `plugin_ops` 能力；结果额外带 `pluginReport` |
@@ -283,8 +283,8 @@ Agent 回：`logs_started {sessionId, tail, timestamps}`、`logs_chunk {sessionI
 
 | 帧 | 方向 | 字段 |
 | --- | --- | --- |
-| `logfile_list` | ↓ | `requestId`, `dir`, `logDir?` |
-| `logfile_list_result` | ↑ | `requestId`, `root`, `files: [{path,size,mtime}]`, `error?`（`mtime` 为带时区偏移的 ISO 8601，如 `2026-09-05T17:30:15+08:00`；`logfile_fetch` 上传的 `X-Hub-File-Mtime` 同此格式） |
+| `logfile_list` | ↓ | `requestId`, `dir`, `logDir?`，单目录分页时另带 `subdir`, `offset?`, `limit?`（见下文） |
+| `logfile_list_result` | ↑ | 概览：`requestId`, `root`, `files: [{path,size,mtime}]`, `dirs: [{dir,total,files}]`, `error?`；单目录分页：`requestId`, `root`, `dir`, `total`, `offset`, `files`, `error?`（`mtime` 为带时区偏移的 ISO 8601，如 `2026-09-05T17:30:15+08:00`；`logfile_fetch` 上传的 `X-Hub-File-Mtime` 同此格式） |
 | `logfile_fetch` | ↓ | `requestId`, `archiveId`, `dir`, `logDir?`, `file`, `uploadPath`, `uploadToken`, `uploadExpiresAt` |
 | `logfile_fetch_result` | ↑ | `requestId`, `archiveId`, `ok`, `sizeRaw?`, `sizeSent?`, `error?`（旁路通知，状态真源是 HTTP 上传） |
 | `logfile_follow` | ↓ | `sessionId`, `dir`, `logDir?`, `subdir`, `tail?`(默认 200，≤500), `filter?` |
@@ -295,7 +295,14 @@ Agent 回：`logs_started {sessionId, tail, timestamps}`、`logs_chunk {sessionI
 | `logfile_error` | ↑ | `sessionId`, `error: {code,message}` |
 | `logfile_unfollow` | ↓ | `sessionId` |
 
-`filter`：`{ levels?: string[], keyword?: string, regex?: boolean, since?: 'YYYY-MM-DD HH:mm:ss', until?: ... }`；以「条目」（首行 + 堆栈续行）为单位匹配，follow 忽略 since/until。上传：agent 边 gzip 边 `POST <HUB_HTTP_URL 或 WS_URL 推导><uploadPath>`，头 `Content-Type: application/gzip`、`X-Hub-Upload-Token`、`X-Hub-Raw-Size`、`X-Hub-File-Mtime`。限制：跟随会话同时最多 3 条、上传同时 1 个，超出回 `busy`；每秒超过 2000 条的条目直接丢并在 `dropped` 报数。与 hub 断连时全部跟随会话、进行中的上传与旧的 `logs_*` 会话一律停止。
+`logfile_list` 两种形态，按请求里有没有 `subdir`（字符串，可以是空串表示日志根）区分：
+
+- **概览**（不带 `subdir`）：日志根下最深 2 层、每个含日志的目录一项 `{dir, total, files}`，`files` 只给该目录 mtime 倒序的首屏 20 条，`total` 是这个目录的文件总数；余下的由中枢按目录单独分页。`files` 是给只认平铺清单的老中枢的：各目录首屏合并后按 mtime 倒序，最多 500 条。
+- **单目录分页**（带 `subdir`）：只列这一个目录、不递归，mtime 倒序取 `[offset, offset+limit)`。`offset` 缺省 0；`limit` 缺省 20、上限 200，越界按边界截。回 `{dir, total, offset, files}`。
+- 老 agent 不认识 `subdir`/`offset`/`limit`，总回平铺 `files`、没有 `dirs`；中枢据概览里有没有 `dirs` 判断能不能按目录翻页，不能的就不发带 `subdir` 的请求。
+- 首屏条数两端同值：agent `LIST_PAGE_SIZE`（`core/log_constants.py`）与中枢 `LOG_LIST_PAGE_SIZE`（plugin-hub 的 `src/constants.ts`），改一边要同时改另一边。
+
+`filter`：`{ levels?: string[], keyword?: string, regex?: boolean, since?: 'YYYY-MM-DD HH:mm:ss', until?: ... }`；以「条目」（首行 + 堆栈续行）为单位匹配，follow 忽略 since/until。上传：agent 边 gzip 边 `POST <HUB_HTTP_URL 或 WS_URL 推导><uploadPath>`，头 `Content-Type: application/gzip`、`X-Hub-Upload-Token`、`X-Hub-Raw-Size`、`X-Hub-File-Mtime`。限制：每台 agent 跟随会话同时最多 8 条（agent `MAX_FOLLOW_SESSIONS` 与中枢 `LOG_STREAM_PER_AGENT` 同值，容纳单机多实例）、上传同时 1 个，超出回 `busy`；每秒超过 2000 条的条目直接丢并在 `dropped` 报数。与 hub 断连时全部跟随会话、进行中的上传与旧的 `logs_*` 会话一律停止。
 
 ## 9. compose 发现
 
@@ -455,7 +462,7 @@ Agent 回：`logs_started {sessionId, tail, timestamps}`、`logs_chunk {sessionI
 
 `error` 同第 11 节：`not_found` / `not_bound` / `unavailable`。
 
-**快照的形状**以 Hub 侧 `plugin-hub/src/server/services/instance-snapshot.ts` 的 `buildInstanceSnapshot` 为准，应用侧只认 `schemaVersion === 1` 且 `instances` 为数组的快照。对照写法：
+**快照的形状**以 nocobase-pro 仓库的 `packages/plugins/@orchisky/plugin-hub/docs/contracts/instance-snapshot-v1.json` 为契约（字段样例和两个取值列表），Hub 生成快照的测试和应用侧（`@orchisky/plugin-ops-guard`）的测试都读它；增删字段或取值要把 `schemaVersion` 加 1。应用侧只认 `schemaVersion === 1` 且 `instances` 为数组的快照。对照写法：
 
 ```ts
 interface InstanceSnapshot {

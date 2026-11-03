@@ -23,7 +23,11 @@ def test_agent_main_starts_health_server_and_reconnects(monkeypatch: pytest.Monk
     fake_ws_client = ModuleType("core.ws_client")
     fake_ws_client.connect = lambda: connect_calls.append("connected")
 
+    fake_startup_checks = ModuleType("core.startup_checks")
+    fake_startup_checks.check_projects_root = lambda: health_calls.append("checked")
+
     monkeypatch.setitem(sys.modules, "config", fake_config)
+    monkeypatch.setitem(sys.modules, "core.startup_checks", fake_startup_checks)
     monkeypatch.setitem(sys.modules, "core.health_server", fake_health_server)
     monkeypatch.setitem(sys.modules, "core.ws_client", fake_ws_client)
     monkeypatch.setattr("time.sleep", lambda seconds: (sleep_calls.append(seconds), (_ for _ in ()).throw(StopLoop()))[1])
@@ -31,6 +35,6 @@ def test_agent_main_starts_health_server_and_reconnects(monkeypatch: pytest.Monk
     with pytest.raises(StopLoop):
         runpy.run_module("agent", run_name="__main__")
 
-    assert health_calls == ["started"]
+    assert health_calls == ["checked", "started"]
     assert connect_calls == ["connected"]
     assert sleep_calls == [5]
